@@ -3,7 +3,7 @@
 import argparse
 import io
 import sys
-import json
+import simplejson as json
 import logging
 import collections
 import threading
@@ -15,7 +15,7 @@ from jsonschema import validate
 import singer
 
 from oauth2client import tools
-from tempfile import TemporaryFile
+from tempfile import TemporaryFile, NamedTemporaryFile
 
 from google.cloud import bigquery
 from google.cloud.bigquery.job import SourceFormat
@@ -34,6 +34,7 @@ except ImportError:
 
 logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
 logger = singer.get_logger()
+logger.setLevel(logging.DEBUG)
 
 SCOPES = ['https://www.googleapis.com/auth/bigquery','https://www.googleapis.com/auth/bigquery.insertdata']
 CLIENT_SECRET_FILE = 'client_secret.json'
@@ -64,7 +65,15 @@ def define_schema(field, name):
                 schema_mode = 'NULLABLE'
             else:
                 field = types
-            
+                break
+
+    if len(field) == 0:
+        logger.info("Generic field detected. name: {}. field obj: {}".format(name, field))
+        schema_type = "RECORD"
+        schema_fields = tuple([SchemaField('__dummy', 'string', 'NULLABLE', None, ())])
+        return (schema_name, schema_type, schema_mode, schema_description, schema_fields)
+
+
     if isinstance(field['type'], list):
         if field['type'][0] == "null":
             schema_mode = 'NULLABLE'
@@ -78,11 +87,17 @@ def define_schema(field, name):
         schema_fields = tuple(build_schema(field))
     if schema_type == "array":
         schema_type = field.get('items').get('type')
+        if isinstance(schema_type, list):
+            schema_type = schema_type[1]
         schema_mode = "REPEATED"
         if schema_type == "object":
           schema_type = "RECORD"
-          schema_fields = tuple(build_schema(field.get('items')))
-
+          if 'properties' in field.get('items'):
+            logger.info("Before nested build_schema call on field name: {}. field obj: {}".format(name, field))
+            schema_fields = tuple(build_schema(field.get('items')))
+          else:
+            # HACK!
+            schema_fields = tuple([SchemaField('__dummy', 'string', 'NULLABLE', None, ())])
 
     if schema_type == "string":
         if "format" in field:
@@ -138,8 +153,24 @@ def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, valida
             if validate_records:
                 validate(msg.record, schema)
 
+            if msg.stream == 'metafields':
+                value_type = type(msg.record['value'])
+                if value_type == int:
+                    msg.record['value__it'] = msg.record['value']
+                    msg.record['value'] = None
+                elif value_type == list:
+                    msg.record['value__ls'] = str(msg.record['value'])
+                    msg.record['value'] = None
+                elif value_type != dict:
+                    msg.record['value__st'] = str(msg.record['value'])
+                    msg.record['value'] = None
+
             # NEWLINE_DELIMITED_JSON expects literal JSON formatted data, with a newline character splitting each row.
-            dat = bytes(json.dumps(msg.record) + '\n', 'UTF-8')
+            try:
+                dat = bytes(json.dumps(msg.record) + '\n', 'UTF-8')
+            except:
+                logger.error("Unable to encode record generated from line:\n{}\nRecords:\n{}".format(line, msg.record))
+                raise
 
             rows[msg.stream].write(dat)
             #rows[msg.stream].write(bytes(str(msg.record) + '\n', 'UTF-8'))
@@ -155,7 +186,7 @@ def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, valida
             schemas[table] = msg.schema
             key_properties[table] = msg.key_properties
             #tables[table] = bigquery.Table(dataset.table(table), schema=build_schema(schemas[table]))
-            rows[table] = TemporaryFile(mode='w+b')
+            rows[table] = NamedTemporaryFile(mode='w+b', delete=False)
             errors[table] = None
             # try:
             #     tables[table] = bigquery_client.create_table(tables[table])
@@ -172,8 +203,13 @@ def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, valida
     for table in rows.keys():
         table_ref = bigquery_client.dataset(dataset_id).table(table)
         SCHEMA = build_schema(schemas[table])
+        logger.info('Schema for table {}:\n{}'.format(table, [field.to_api_repr() for field in SCHEMA]))
         load_config = LoadJobConfig()
         load_config.schema = SCHEMA
+        load_config.autodetect = True # Pedro
+        if table == 'metafields':
+            load_config.schema = None
+
         load_config.source_format = SourceFormat.NEWLINE_DELIMITED_JSON
 
         if truncate:
@@ -181,6 +217,8 @@ def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, valida
 
         rows[table].seek(0)
         logger.info("loading {} to Bigquery.\n".format(table))
+        logger.info("Temp file: {}".format(rows[table].name))
+
         load_job = bigquery_client.load_table_from_file(
             rows[table], table_ref, job_config=load_config)
         logger.info("loading job {}".format(load_job.job_id))
@@ -228,7 +266,12 @@ def persist_lines_stream(project_id, dataset_id, lines=None, validate_records=Tr
             if validate_records:
                 validate(msg.record, schema)
 
-            errors[msg.stream] = bigquery_client.insert_rows_json(tables[msg.stream], [msg.record])
+            try:
+                msg_no_decimal = json.loads(line, use_decimal=False)
+                errors[msg.stream] = bigquery_client.insert_rows_json(tables[msg.stream], [msg_no_decimal['record']])
+            except:
+                logger.error("Unable to insert record:\n{}".format(msg.record))
+                raise
             rows[msg.stream] += 1
 
             state = None
@@ -248,6 +291,9 @@ def persist_lines_stream(project_id, dataset_id, lines=None, validate_records=Tr
                 tables[table] = bigquery_client.create_table(tables[table])
             except exceptions.Conflict:
                 pass
+            except:
+                logger.error('Failed to create table: {}'.format(tables[table]))
+                raise
 
         elif isinstance(msg, singer.ActivateVersionMessage):
             # This is experimental and won't be used yet
